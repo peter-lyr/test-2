@@ -178,7 +178,8 @@ def scan_and_categorize_files():
     git_files, deleted_files = get_git_status()
     if not git_files and not deleted_files:
         print("📭 No modified, untracked or deleted files found")
-        return {}, []
+        return {}, [], []
+
     all_files = []
     for file_path in git_files:
         if os.path.isdir(file_path):
@@ -188,13 +189,16 @@ def scan_and_categorize_files():
             )
         else:
             all_files.append((file_path, get_file_size_mb(file_path)))
+
     if not all_files and not deleted_files:
         print("📭 No valid files to process")
-        return {}, []
+        return {}, [], []
+
     dir_files_map = defaultdict(list)
     for file_path, size_mb in all_files:
         if dir_path := os.path.dirname(file_path):
             dir_files_map[dir_path].append((file_path, size_mb))
+
     result_dict, processed_files = {}, set()
     for dir_path in sorted(
         dir_files_map.keys(), key=lambda x: x.count(os.sep), reverse=True
@@ -213,10 +217,18 @@ def scan_and_categorize_files():
                 if file_path not in processed_files:
                     result_dict[file_path] = size_mb
                     processed_files.add(file_path)
+
     for file_path, size_mb in all_files:
         if not os.path.dirname(file_path) and file_path not in processed_files:
             result_dict[file_path] = size_mb
-    return result_dict, deleted_files
+
+    # 将已删除文件按目录分组
+    deleted_files_by_dir = defaultdict(list)
+    for file_path in deleted_files:
+        dir_path = os.path.dirname(file_path) or "."
+        deleted_files_by_dir[dir_path].append(file_path)
+
+    return result_dict, deleted_files, deleted_files_by_dir
 
 
 def run_git_commands(commands):
@@ -230,11 +242,15 @@ def run_git_commands(commands):
     return success
 
 
-def commit_batch(file_paths, batch_total_size, batch_number, total_batches):
-    """提交一个批次的文件"""
+def commit_batch(
+    file_paths, deleted_paths, batch_total_size, batch_number, total_batches
+):
+    """提交一个批次的文件（包括未追踪和已删除文件）"""
     print(
-        f"📦 Batch {batch_number}/{total_batches}: {len(file_paths)} files, {batch_total_size:.2f} MB"
+        f"📦 Batch {batch_number}/{total_batches}: {len(file_paths)} files, {len(deleted_paths)} deleted files, {batch_total_size:.2f} MB"
     )
+
+    # 处理未追踪文件
     valid_paths = []
     for path in file_paths:
         if os.path.exists(path):
@@ -247,70 +263,148 @@ def commit_batch(file_paths, batch_total_size, batch_number, total_batches):
                 valid_paths.append(path)
         else:
             print(f"⚠️  Path does not exist: {path}")
-    if not valid_paths:
+
+    # 处理已删除文件
+    valid_deleted_paths = []
+    for path in deleted_paths:
+        # 检查文件是否确实不存在（已被删除）
+        if not os.path.exists(path):
+            valid_deleted_paths.append(path)
+        else:
+            print(f"⚠️  File marked as deleted but still exists: {path}")
+
+    if not valid_paths and not valid_deleted_paths:
         print("⏭️  No valid paths, skipping batch")
         return False
+
+    # 添加未追踪文件
     successful_adds = 0
     for path in valid_paths:
         if run_git_commands([f'git add "{os.path.normpath(path)}"']):
             successful_adds += 1
-    print(f"✅ Added {successful_adds}/{len(valid_paths)} files")
-    return successful_adds > 0 and run_git_commands(
-        [f"git commit -F {COMMIT_INFO_FILE}", "git push"]
+
+    # 添加已删除文件
+    successful_deletes = 0
+    for path in valid_deleted_paths:
+        if run_git_commands([f'git rm "{os.path.normpath(path)}"']):
+            successful_deletes += 1
+
+    print(
+        f"✅ Added {successful_adds}/{len(valid_paths)} files, removed {successful_deletes}/{len(valid_deleted_paths)} files"
     )
 
+    # 只有当有实际变更时才提交
+    if successful_adds > 0 or successful_deletes > 0:
+        return run_git_commands([f"git commit -F {COMMIT_INFO_FILE}", "git push"])
+    else:
+        print("⏭️  No changes to commit, skipping")
+        return True
 
-def commit_in_batches(files_dict, deleted_files, total_size):
-    """分批提交文件"""
+
+def commit_in_batches(files_dict, deleted_files_by_dir, total_size):
+    """分批提交文件，将同一目录下的未追踪和已删除文件放在同一批次"""
     batches = []
-    current_batch, current_size = [], 0
-    for path, size in files_dict.items():
-        if size > 100:
-            print(f"⏭️  Skipping large file: {path} ({size:.2f} MB)")
-            continue
-        if current_size + size > 100:
-            batches.append((current_batch.copy(), current_size))
-            current_batch, current_size = [path], size
-        else:
-            current_batch.append(path)
-            current_size += size
-    if current_batch:
-        batches.append((current_batch, current_size))
+    current_batch, current_deleted, current_size = [], [], 0
+
+    # 创建一个包含所有目录的列表，包括有未追踪文件和已删除文件的目录
+    all_dirs = set(files_dict.keys())
+    for dir_path in deleted_files_by_dir.keys():
+        # 如果目录中有已删除文件但没有未追踪文件，添加一个大小为0的条目
+        if dir_path not in files_dict:
+            files_dict[dir_path] = 0
+            all_dirs.add(dir_path)
+
+    # 按目录深度排序
+    sorted_dirs = sorted(all_dirs, key=lambda x: x.count(os.sep), reverse=True)
+
+    for dir_path in sorted_dirs:
+        dir_files = []
+        dir_size = 0
+
+        # 如果是目录条目，获取该目录下所有文件
+        if dir_path in files_dict and os.path.isdir(dir_path):
+            for root, _, files in os.walk(dir_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    if os.path.exists(file_path):  # 确保文件存在
+                        size_mb = get_file_size_mb(file_path)
+                        dir_files.append(file_path)
+                        dir_size += size_mb
+        elif dir_path in files_dict:
+            # 单个文件
+            if os.path.exists(dir_path):
+                dir_files = [dir_path]
+                dir_size = files_dict[dir_path]
+
+        # 获取该目录下的已删除文件
+        dir_deleted = deleted_files_by_dir.get(dir_path, [])
+
+        # 如果当前批次加上这个目录的内容超过100MB，开始新批次
+        if current_size + dir_size > 100 and (current_batch or current_deleted):
+            batches.append((current_batch.copy(), current_deleted.copy(), current_size))
+            current_batch, current_deleted, current_size = [], [], 0
+
+        # 添加目录内容到当前批次
+        current_batch.extend(dir_files)
+        current_deleted.extend(dir_deleted)
+        current_size += dir_size
+
+        # 如果单个目录就超过100MB，需要单独处理
+        if dir_size > 100:
+            print(
+                f"⚠️  Directory {dir_path} exceeds 100MB ({dir_size:.2f} MB), splitting..."
+            )
+            # 对于大目录，我们单独提交其中的文件
+            for file_path in dir_files:
+                file_size = get_file_size_mb(file_path)
+                if file_size <= 100:  # 跳过超过100MB的大文件，它们应该已经被处理了
+                    if current_size + file_size > 100 and (
+                        current_batch or current_deleted
+                    ):
+                        batches.append(
+                            (current_batch.copy(), current_deleted.copy(), current_size)
+                        )
+                        current_batch, current_deleted, current_size = [], [], 0
+                    current_batch.append(file_path)
+                    current_size += file_size
+
+    # 添加最后一个批次
+    if current_batch or current_deleted:
+        batches.append((current_batch, current_deleted, current_size))
+
     print(f"📋 Total batches: {len(batches)}")
     committed_size = 0
-    for i, (batch, batch_size) in enumerate(batches, 1):
-        if commit_batch(batch, batch_size, i, len(batches)):
+
+    for i, (batch, deleted, batch_size) in enumerate(batches, 1):
+        if commit_batch(batch, deleted, batch_size, i, len(batches)):
             committed_size += batch_size
             print(f"✅ Completed Batch {i}/{len(batches)}")
             progress = (committed_size / total_size * 100) if total_size > 0 else 100
             print(
                 f"📈 Progress: {committed_size:.2f}/{total_size:.2f} MB ({progress:.1f}%)"
             )
-    if deleted_files:
-        print("\n🗑️  Committing deleted files...")
-        run_git_commands(
-            ["git add -u", f"git commit -F {COMMIT_INFO_FILE}", "git push"]
-        )
+
     return True
 
 
-def execute_git_commands(files_dict, deleted_files):
+def execute_git_commands(files_dict, deleted_files, deleted_files_by_dir):
     """执行git命令"""
     if not files_dict and not deleted_files:
         print("📭 No files to commit")
         return False
+
     total_size = sum(files_dict.values())
     print(f"📊 Total size: {total_size:.2f} MB")
-    if deleted_files:
-        print(f"🗑️  Deleted files: {len(deleted_files)}")
-    if total_size <= 100 or (total_size == 0 and deleted_files):
+    print(f"🗑️  Deleted files: {len(deleted_files)}")
+
+    if total_size <= 100 and len(deleted_files) == 0:
         print("\n🚀 Committing all files at once...")
         return run_git_commands(
             ["git add -A", f"git commit -F {COMMIT_INFO_FILE}", "git push"]
         )
     else:
-        print("\n📦 Total size > 100MB, committing in batches...")
-        return commit_in_batches(files_dict, deleted_files, total_size)
+        print("\n📦 Committing in batches (files and deletions together)...")
+        return commit_in_batches(files_dict, deleted_files_by_dir, total_size)
 
 
 def main():
@@ -324,11 +418,11 @@ def main():
         sys.exit(1)
     print("🔍 Checking for large untracked files...")
     process_large_untracked_files()
-    files_dict, deleted_files = scan_and_categorize_files()
+    files_dict, deleted_files, deleted_files_by_dir = scan_and_categorize_files()
     if not files_dict and not deleted_files:
         print("📭 No files to process")
         return
-    if execute_git_commands(files_dict, deleted_files):
+    if execute_git_commands(files_dict, deleted_files, deleted_files_by_dir):
         print("\n🎉 All operations completed successfully!")
     else:
         print("\n❌ Some operations failed")
