@@ -227,7 +227,6 @@ def scan_and_categorize_files():
     for file_path in deleted_files:
         dir_path = os.path.dirname(file_path) or "."
         deleted_files_by_dir[dir_path].append(file_path)
-
     return result_dict, deleted_files, deleted_files_by_dir
 
 
